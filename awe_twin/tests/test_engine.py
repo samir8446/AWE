@@ -20,7 +20,7 @@ def synth():
 
 
 def test_version():
-    assert E.ENGINE_VERSION == "0.2.0"
+    assert E.ENGINE_VERSION == "0.3.0"
 
 
 def test_reproduces_ham25():

@@ -14,7 +14,8 @@ import streamlit as st  # noqa: E402  (stand-in)
 import engine as E  # noqa: E402
 
 VIEWS = ["Home", "Diagnostics", "Live twin", "Models", "Operations", "Study"]
-FIRE = "Replay|Run assessment|Optimise|Update-frequency|Measurement ablation|no-leakage"
+ADV_VIEWS = ["DRT", "Degradation", "Anomalies", "Study"]
+FIRE = "Replay|Run assessment|Optimise|Update-frequency|Measurement ablation|no-leakage|Run anomaly|Back-test|Fit DRT-guided|Generate figure"
 
 
 def render(view, fire=""):
@@ -35,6 +36,7 @@ def render(view, fire=""):
 @pytest.mark.parametrize("view", VIEWS)
 def test_synthetic_views(view):
     st.session_state.clear()
+    st.session_state["src"] = "Synthetic: Ni fleet (6 cells, 3 conditions)"
     st.session_state["syn_hours"] = 600
     st.session_state["m_units"] = ["S1", "S5"]
     st.session_state["m_models"] = ["Persistence", "Linear drift", "Bayesian ridge"]
@@ -50,6 +52,15 @@ def test_single_uploaded_unit(view):
     st.session_state["src"] = "My data (upload)"
     st.session_state["tables"] = {"timeseries": df}
     st.session_state["m_models"] = ["Persistence", "Linear drift"]
+    assert render(view, FIRE) == []
+    assert render(view) == []
+
+
+@pytest.mark.parametrize("view", ADV_VIEWS)
+def test_stainless_steel_views(view):
+    st.session_state.clear()
+    st.session_state["src"] = "Synthetic: stainless-steel ageing (replicates, DRT-rich)"
+    st.session_state["ss_cells"] = 1
     assert render(view, FIRE) == []
     assert render(view) == []
 

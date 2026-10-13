@@ -21,7 +21,7 @@ import pandas as pd
 from scipy import optimize
 from scipy.stats import spearmanr, t as t_dist, theilslopes, wilcoxon
 
-ENGINE_VERSION = "0.2.0"
+ENGINE_VERSION = "0.3.0"
 
 F = 96485.0            # C/mol  [Hu22 nomenclature]
 R_GAS = 8.314          # J/mol/K [Hu22]
@@ -722,7 +722,10 @@ def eis_hf_intercept(eis: pd.DataFrame, area_cm2: float) -> pd.DataFrame:
     """Ohmic resistance from each spectrum: Z' where -Z'' crosses zero at high frequency (else Z' at the highest
     frequency). Returned both in ohm and area-specific ohm cm2."""
     rows = []
-    for (u, t), d in eis.groupby(["unit", "time_h"]):
+    keys = ["unit", "time_h"] + (["j_A_cm2"] if "j_A_cm2" in eis and eis["j_A_cm2"].notna().any() else [])
+    for kk, d in eis.groupby(keys):
+        u, t = kk[0], kk[1]
+        jj = kk[2] if len(kk) > 2 else np.nan
         d = d.sort_values("freq_Hz", ascending=False)
         zi, zr = d["z_im_neg"].to_numpy(), d["z_re"].to_numpy()
         k = np.nonzero(np.sign(zi[:-1]) != np.sign(zi[1:]))[0]
@@ -732,7 +735,8 @@ def eis_hf_intercept(eis: pd.DataFrame, area_cm2: float) -> pd.DataFrame:
         else:
             r = zr[0]
         rp = float(zr.max() - r)
-        rows.append(dict(unit=u, time_h=t, R_hf_ohm=float(r), R_ohm_cm2=float(r) * area_cm2, R_pol_ohm_cm2=rp * area_cm2))
+        rows.append(dict(unit=u, time_h=t, j_A_cm2=jj, R_hf_ohm=float(r), R_ohm_cm2=float(r) * area_cm2,
+                         R_pol_ohm_cm2=rp * area_cm2))
     return pd.DataFrame(rows)
 
 
@@ -772,7 +776,8 @@ def attach_indicators(W: pd.DataFrame, data: Dict[str, pd.DataFrame], design: Ce
     W = W.copy()
     extra = []
     if data.get("eis") is not None and len(data["eis"]):
-        e = eis_hf_intercept(data["eis"], design.area_cm2)[["unit", "time_h", "R_ohm_cm2"]].rename(columns={"R_ohm_cm2": "R_EIS_ohm_cm2"})
+        e = (eis_hf_intercept(data["eis"], design.area_cm2).groupby(["unit", "time_h"], as_index=False)["R_ohm_cm2"]
+             .median().rename(columns={"R_ohm_cm2": "R_EIS_ohm_cm2"}))
         extra.append(e)
     if data.get("polcurve") is not None and len(data["polcurve"]):
         p = fit_polcurve(data["polcurve"], design, kin)

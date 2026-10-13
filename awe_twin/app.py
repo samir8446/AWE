@@ -12,7 +12,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-REQUIRED_ENGINE = "0.2.0"
+REQUIRED_ENGINE = "0.3.0"
+REQUIRED_MODULES = "0.3.0"     # drt.py, degradation.py, anomaly.py, synthetic_ss.py
 REQUIRED_FUNCS = ["cell_voltage", "hto_percent", "build_windows", "attach_indicators", "rank_indicators",
                   "degradation_v1", "run_task", "score_tasks", "scoreboard", "kalman_replay", "particle_filter_eol",
                   "operating_map", "optimise_operation", "synthetic_dataset", "apply_mapping", "guess_mapping",
@@ -27,11 +28,22 @@ try:
 except Exception as exc:  # noqa: BLE001
     E, _ok = None, False
     st.error(f"engine.py could not be imported: {exc}")
+try:
+    import anomaly as AN
+    import degradation as G
+    import drt as D
+    import synthetic_ss as SS
+    _mods = {m.__name__: getattr(m, "__version__", "?") for m in (D, G, AN, SS)}
+    _ok = _ok and all(v == REQUIRED_MODULES for v in _mods.values())
+except Exception as exc:  # noqa: BLE001
+    _mods, _ok = {}, False
+    st.error(f"Analysis modules could not be imported: {exc}")
 if not _ok:
     stray = [os.path.basename(p) for p in glob.glob(os.path.join(HERE, "engine*.py")) if os.path.basename(p) != "engine.py"]
     loaded = getattr(E, "__file__", "?") if E else "?"
     st.error(f"Engine version mismatch: the app needs engine {REQUIRED_ENGINE}, loaded "
-             f"{getattr(E, 'ENGINE_VERSION', 'none')} from {loaded}. Stray copies: {stray or 'none'}. "
+             f"{getattr(E, 'ENGINE_VERSION', 'none')} from {loaded}; modules {_mods} (need {REQUIRED_MODULES}). "
+             f"Stray copies: {stray or 'none'}. "
              "Put app.py and engine.py from the same release side by side and reboot.")
     st.stop()
 
@@ -147,16 +159,36 @@ def c_task(_W, wkey: str, unit: str, share: float, model: str, mode: str, params
 
 
 # ----------------------------------------------------------------------------------------------- sidebar: inputs
+SOURCES = ["Synthetic: Ni fleet (6 cells, 3 conditions)", "Synthetic: stainless-steel ageing (replicates, DRT-rich)",
+           "My data (upload)"]
+
+
+@st.cache_data(show_spinner="Generating stainless-steel scenario...")
+def c_synth_ss(seed: int, n_cells: int, fmin: float, ver: str):
+    return SS.synthetic_ss_dataset(seed=seed, n_cells=n_cells, params=dict(f_min_Hz=fmin))
+
+
+@st.cache_data(show_spinner="KK test + DRT + peaks for every spectrum (cached afterwards)...")
+def c_drt(_eis, ekey: str, area: float, method: str, lam, prominence: float, inductance: bool, units: tuple):
+    e = _eis[_eis["unit"].isin(units)] if units else _eis
+    return D.analyse_all(e, area, method=method, lam=lam, prominence=prominence, inductance=inductance)
+
+
 def sidebar_inputs():
     sb = st.sidebar
     sb.markdown("### AWE Digital Twin")
     sb.caption(f"engine {E.ENGINE_VERSION}")
     with sb.expander("1 · Data", expanded=True):
-        src = st.radio("Data source", ["Synthetic demo (known parameters)", "My data (upload)"], key="src",
-                       help="The synthetic demo has known degradation parameters so every method can be checked.")
-        if src.startswith("Synthetic"):
+        src = st.radio("Data source", SOURCES, key="src",
+                       help="Synthetic data have known parameters so every method can be checked against the truth.")
+        if src == SOURCES[0]:
             st.number_input("Demo duration (h)", 500, 6000, 2000, 500, key="syn_hours")
             st.number_input("Random seed", 0, 99, 0, key="syn_seed")
+        elif src == SOURCES[1]:
+            st.number_input("Replicate cells", 1, 6, 3, key="ss_cells")
+            st.number_input("Random seed", 0, 99, 0, key="ss_seed")
+            st.selectbox("EIS lowest frequency (Hz)", [0.05, 0.01], key="ss_fmin",
+                         help="Lower frequencies resolve the mass-transport peak better (closure error 22 -> 13 mV in tests).")
         else:
             upload_panel(st)
     with sb.expander("2 · Cell / stack design"):
@@ -303,20 +335,29 @@ def faraday_from_state():
 # ----------------------------------------------------------------------------------------------- data assembly
 sidebar_inputs()
 design, op, fp = design_from_state(), op_from_state(), faraday_from_state()
-truth, source = None, None
-if ss.get("src", "Synthetic").startswith("Synthetic"):
+truth, source, labels, scen = None, None, None, None
+src_sel = ss.get("src", SOURCES[0])
+if src_sel == SOURCES[0]:
     syn = c_synth(int(ss.get("syn_seed", 0)), int(ss.get("syn_hours", 2000)), E.ENGINE_VERSION)
-    data, truth, source = syn["data"], syn["truth"], "synthetic"
+    data, truth, source, scen = syn["data"], syn["truth"], "synthetic", "ni"
     design = syn["design"]          # the demo has its own declared cell
+elif src_sel == SOURCES[1]:
+    syn = c_synth_ss(int(ss.get("ss_seed", 0)), int(ss.get("ss_cells", 3)), float(ss.get("ss_fmin", 0.05)), E.ENGINE_VERSION)
+    data, truth, source, scen, labels = syn["data"], syn["truth"], "synthetic", "ss", syn["anomalies"]
+    design = syn["design"]
 else:
     data = ss.get("tables", {})
     source = "real" if data else None
 
 pc_fit = E.fit_polcurve(data["polcurve"], design, E.Kinetics()) if data.get("polcurve") is not None and len(data["polcurve"]) else None
 kin = kin_from_state(pc_fit)
-if source == "synthetic" and ss.get("k_mode", "").startswith("Literature"):
+if scen == "ni" and ss.get("k_mode", "").startswith("Literature"):
     kin = E.Kinetics(**{**asdict(kin), **{k: v for k, v in asdict(syn["kin"]).items() if k in ("j0_c_ref", "j0_a_ref")}})
 ref = op
+if scen == "ss":                      # stainless steel: kinetics fitted from the U-i curves, scenario conditions
+    kin = E.kinetics_from_fit(pc_fit) if pc_fit is not None and len(pc_fit) else kin
+    ref = syn["ref"]
+    op = ref
 W = pd.DataFrame()
 if data.get("timeseries") is not None and len(data["timeseries"]):
     dkey = key_of(*[data[k] for k in sorted(data)])
@@ -330,7 +371,8 @@ THR = float(ss.get("a_eol", 15.0))
 st.markdown("<p class='awe-title'>AWE Digital Twin · alkaline water electrolyser</p>"
             "<p class='awe-sub'>health diagnostics · degradation forecasts with uncertainty · self-updating twin · "
             "operation & maintenance</p>", unsafe_allow_html=True)
-VIEWS = ["Home", "Diagnostics", "Live twin", "Models & forecasting", "Operations & control", "Study results"]
+VIEWS = ["Home", "Diagnostics", "DRT & mechanisms", "Degradation analysis", "Anomalies", "Live twin",
+         "Models & forecasting", "Operations & control", "Study results"]
 view = st.segmented_control("View", VIEWS, default="Home", required=True, key="view", label_visibility="collapsed")
 chip_src = ("<span class='awe-chip awe-syn'><b>SYNTHETIC</b> data, known parameters</span>" if source == "synthetic"
             else "<span class='awe-chip awe-real'><b>REAL</b> data</span>" if source == "real"
@@ -339,7 +381,7 @@ n_units = W["unit"].nunique() if len(W) else 0
 st.markdown(f"<div class='awe-bar'>{chip_src}<span class='awe-chip'>units: <b>{n_units}</b></span>"
             f"<span class='awe-chip'>cell: <b>{design.n_cells} x {design.area_cm2:g} cm2</b></span>"
             f"<span class='awe-chip'>reference: <b>{op.T_C:g} C · {op.P_bar:g} bar · {op.j_A_cm2:g} A/cm2 · "
-            f"{op.koh_wt:g} wt%</b></span><span class='awe-chip'>kinetics: <b>{kin.mode}</b></span>"
+            f"{op.koh_wt:.1f} wt%</b></span><span class='awe-chip'>kinetics: <b>{kin.mode}</b></span>"
             f"<span class='awe-chip'>EOL: <b>+{THR:g} mV</b></span><span class='awe-chip'>engine "
             f"<b>{E.ENGINE_VERSION}</b></span></div>", unsafe_allow_html=True)
 for n in ss.get("load_notes", [])[-6:]:
@@ -713,7 +755,7 @@ def view_live():
     fig = go.Figure(go.Scatter(x=d.loc[d["stable"], "op_hours"], y=d.loc[d["stable"], "dV_mV"], mode="markers",
                                marker=dict(size=4, color="#9aa4b2"), name="measured dV"))
     fig.add_trace(go.Scatter(x=kf["op_hours"], y=kf["dV_ref_mV"], name="twin (KF) at reference j", line=dict(color=PAL[0], width=2)))
-    if truth is not None:
+    if truth is not None and "dV_ref_mV" in truth:
         tu = truth[truth["unit"] == u]
         fig.add_trace(go.Scatter(x=tu["op_hours"], y=tu["dV_ref_mV"] - tu["dV_ref_mV"].iloc[0], name="synthetic truth",
                                  line=dict(color=PAL[2], width=1.5, dash="dash")))
@@ -751,7 +793,8 @@ def view_live():
     with c2:
         if st.button("Measurement ablation (which sensors matter?)", key="lt_abl"):
             with st.spinner("Rebuilding indicators without each sensor..."):
-                ss["res_lt_abl"] = E.measurement_ablation(data, design, kin, op, u, truth)
+                ss["res_lt_abl"] = E.measurement_ablation(data, design, kin, op, u,
+                                                          truth if truth is not None and "dV_ref_mV" in truth else None)
         if ss.get("res_lt_abl") is not None:
             st.dataframe(ss["res_lt_abl"].round(3), hide_index=True)
 
@@ -879,5 +922,12 @@ def view_results():
                "condition group, recoveries flagged and kept in test data.")
 
 
-{"Home": view_home, "Diagnostics": view_diagnostics, "Live twin": view_live, "Models & forecasting": view_models,
- "Operations & control": view_ops, "Study results": view_results}[view]()
+import views_advanced as VA  # noqa: E402  (advanced views: DRT, degradation analysis, anomalies, paper figures)
+
+CTX = dict(st=st, ss=ss, E=E, D=D, G=G, AN=AN, data=data, W=W, design=design, kin=kin, op=op, ref=ref, THR=THR,
+           truth=truth, labels=labels, source=source, scen=scen, syn=syn if source == "synthetic" else None,
+           style=style, PAL=PAL, explain=explain, eq_popover=eq_popover, key_of=key_of, c_drt=c_drt, go=go)
+{"Home": view_home, "Diagnostics": view_diagnostics, "DRT & mechanisms": lambda: VA.view_drt(CTX),
+ "Degradation analysis": lambda: VA.view_degradation(CTX), "Anomalies": lambda: VA.view_anomalies(CTX),
+ "Live twin": view_live, "Models & forecasting": view_models, "Operations & control": view_ops,
+ "Study results": lambda: (view_results(), VA.view_paper(CTX))}[view]()
