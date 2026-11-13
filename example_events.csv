@@ -1,0 +1,5 @@
+time_h,event
+240,koh_refill
+480,power_supply_change
+720,koh_refill
+880,power_supply_change
